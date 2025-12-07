@@ -1,0 +1,24 @@
+# Temporary files
+*.tmp
+*.log
+*.bak
+*.swp
+*.swo
+*~
+
+# Backup directories
+backup/
+*.backup
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Editor-specific
+.vscode/
+.idea/
+*.sublime-*
+
+# Test artifacts
+test-*.sh
+/tmp/
