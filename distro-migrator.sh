@@ -19,7 +19,7 @@ set -euo pipefail
 readonly SCRIPT_VERSION="1.0.0"
 readonly SCRIPT_NAME="distro-migrator.sh"
 readonly LOG_FILE="/var/log/distro-migration.log"
-readonly BACKUP_DIR="/tmp/distro-migration-backup"
+readonly BACKUP_DIR="/var/backups/distro-migration-backup"
 readonly MIN_DISK_SPACE_GB=10
 readonly CONFIRMATION_PHRASE="DESTROY-AND-REPLACE"
 
@@ -169,7 +169,7 @@ check_not_container() {
 }
 
 check_disk_space() {
-    local free_space_gb=$(df / | awk 'NR==2 {print int($4/1024/1024)}')
+    local free_space_gb=$(df -P / | awk 'NR==2 {print int($4/1024/1024)}')
     if [[ $free_space_gb -lt $MIN_DISK_SPACE_GB ]]; then
         log_fatal "Insufficient disk space. Need at least ${MIN_DISK_SPACE_GB}GB, have ${free_space_gb}GB"
     fi
@@ -225,7 +225,7 @@ detect_cloud_provider() {
     fi
     
     # Azure detection
-    if curl -s -m 2 -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-02-01" &>/dev/null; then
+    if curl -s -m 2 -H "Metadata:true" "http://169.254.169.254/metadata/instance?api-version=2021-12-13" &>/dev/null; then
         DETECTED_CLOUD="azure"
         log_success "Detected Azure"
         return 0
@@ -635,8 +635,32 @@ restore_network_ubuntu_debian() {
     
     mkdir -p "$target_dir/etc/netplan"
     
-    # Create netplan configuration
-    cat > "$target_dir/etc/netplan/01-netcfg.yaml" << EOF
+    # Detect if using DHCP or static IP by checking current configuration
+    local use_dhcp=true
+    if [[ -f /etc/netplan/01-netcfg.yaml ]] || [[ -f /etc/netplan/50-cloud-init.yaml ]]; then
+        # Check netplan files
+        if grep -q "dhcp4.*true" /etc/netplan/*.yaml 2>/dev/null; then
+            use_dhcp=true
+        elif grep -q "addresses:" /etc/netplan/*.yaml 2>/dev/null; then
+            use_dhcp=false
+        fi
+    elif [[ -f /etc/network/interfaces ]]; then
+        # Check traditional interfaces file
+        if grep -q "iface.*dhcp" /etc/network/interfaces 2>/dev/null; then
+            use_dhcp=true
+        elif grep -q "iface.*static" /etc/network/interfaces 2>/dev/null; then
+            use_dhcp=false
+        fi
+    fi
+    
+    # For cloud environments, prefer DHCP
+    if [[ "$DETECTED_CLOUD" != "generic" ]]; then
+        use_dhcp=true
+    fi
+    
+    if $use_dhcp; then
+        # Create DHCP netplan configuration
+        cat > "$target_dir/etc/netplan/01-netcfg.yaml" << EOF
 network:
   version: 2
   renderer: networkd
@@ -645,10 +669,9 @@ network:
       dhcp4: true
       dhcp6: false
 EOF
-    
-    # For static IP (if detected as static)
-    if [[ -n "$CURRENT_IP" ]] && ! grep -q "dhcp" /etc/network/interfaces 2>/dev/null; then
-        local netmask=$(ip addr show "$CURRENT_INTERFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f2)
+    else
+        # Create static IP netplan configuration
+        local netmask=$(ip addr show "$CURRENT_INTERFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f2 | head -n1)
         cat > "$target_dir/etc/netplan/01-netcfg.yaml" << EOF
 network:
   version: 2
@@ -671,18 +694,39 @@ restore_network_rhel() {
     
     mkdir -p "$target_dir/etc/sysconfig/network-scripts"
     
-    # Create interface configuration
-    cat > "$target_dir/etc/sysconfig/network-scripts/ifcfg-$CURRENT_INTERFACE" << EOF
+    # Detect if using DHCP or static IP
+    local use_dhcp=true
+    if [[ -f "/etc/sysconfig/network-scripts/ifcfg-$CURRENT_INTERFACE" ]]; then
+        if grep -q "BOOTPROTO.*dhcp" "/etc/sysconfig/network-scripts/ifcfg-$CURRENT_INTERFACE" 2>/dev/null; then
+            use_dhcp=true
+        elif grep -q "BOOTPROTO.*static\|BOOTPROTO.*none" "/etc/sysconfig/network-scripts/ifcfg-$CURRENT_INTERFACE" 2>/dev/null; then
+            use_dhcp=false
+        fi
+    fi
+    
+    # For cloud environments, prefer DHCP
+    if [[ "$DETECTED_CLOUD" != "generic" ]]; then
+        use_dhcp=true
+    fi
+    
+    if $use_dhcp; then
+        # Create DHCP interface configuration
+        cat > "$target_dir/etc/sysconfig/network-scripts/ifcfg-$CURRENT_INTERFACE" << EOF
 DEVICE=$CURRENT_INTERFACE
 BOOTPROTO=dhcp
 ONBOOT=yes
 TYPE=Ethernet
 EOF
-    
-    # For static IP configuration
-    if [[ -n "$CURRENT_IP" ]] && ! grep -q "dhcp" "/etc/sysconfig/network-scripts/ifcfg-$CURRENT_INTERFACE" 2>/dev/null; then
-        local netmask=$(ip addr show "$CURRENT_INTERFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f2)
-        local prefix=$(ip addr show "$CURRENT_INTERFACE" | grep "inet " | awk '{print $2}')
+    else
+        # Create static IP interface configuration
+        local netmask=$(ip addr show "$CURRENT_INTERFACE" | grep "inet " | awk '{print $2}' | cut -d/ -f2 | head -n1)
+        
+        # Convert DNS list to array for proper handling
+        local dns_array=($CURRENT_DNS)
+        local dns_config=""
+        for i in "${!dns_array[@]}"; do
+            dns_config="${dns_config}DNS$((i+1))=${dns_array[$i]}\n"
+        done
         
         cat > "$target_dir/etc/sysconfig/network-scripts/ifcfg-$CURRENT_INTERFACE" << EOF
 DEVICE=$CURRENT_INTERFACE
@@ -692,9 +736,7 @@ TYPE=Ethernet
 IPADDR=$CURRENT_IP
 PREFIX=$netmask
 GATEWAY=$CURRENT_GATEWAY
-$(for i in $(seq 1 $(echo $CURRENT_DNS | wc -w)); do 
-    echo "DNS$i=$(echo $CURRENT_DNS | cut -d' ' -f$i)"
-done)
+$(echo -e "$dns_config")
 EOF
     fi
 }
