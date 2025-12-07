@@ -547,6 +547,32 @@ detect_root_device() {
     
     ROOT_PARTITION=$(df / | tail -1 | awk '{print $1}')
     
+    # Resolve /dev/root symlink to actual device
+    if [[ "$ROOT_PARTITION" == "/dev/root" ]]; then
+        # Try multiple methods to resolve the actual root device
+        if [[ -L /dev/root ]]; then
+            ROOT_PARTITION=$(readlink -f /dev/root)
+        else
+            # Use findmnt to get the actual device
+            ROOT_PARTITION=$(findmnt -n -o SOURCE /)
+        fi
+        
+        # If still /dev/root, try using /proc/mounts
+        if [[ "$ROOT_PARTITION" == "/dev/root" ]] || [[ -z "$ROOT_PARTITION" ]]; then
+            ROOT_PARTITION=$(grep "^[^ ]* / " /proc/mounts | awk '{print $1}' | head -n1)
+        fi
+        
+        # Last resort: try lsblk
+        if [[ "$ROOT_PARTITION" == "/dev/root" ]] || [[ -z "$ROOT_PARTITION" ]]; then
+            local dev_name=$(lsblk -rno NAME,MOUNTPOINT | grep "^[^ ]* /$" | awk '{print $1}' | head -n1)
+            if [[ -n "$dev_name" ]]; then
+                ROOT_PARTITION="/dev/$dev_name"
+            fi
+        fi
+        
+        log_info "Resolved /dev/root to actual device: $ROOT_PARTITION"
+    fi
+    
     # Extract device name (remove partition number)
     if [[ $ROOT_PARTITION =~ ^/dev/nvme ]]; then
         ROOT_DEVICE=$(echo "$ROOT_PARTITION" | sed 's/p[0-9]*$//')
@@ -586,6 +612,22 @@ install_ubuntu_debian() {
         fi
     fi
     
+    # Verify debootstrap and its scripts are available
+    if ! command -v debootstrap &>/dev/null; then
+        log_fatal "debootstrap is not installed and could not be installed"
+    fi
+    
+    # Check if debootstrap scripts directory exists
+    local debootstrap_scripts="/usr/share/debootstrap/scripts"
+    if [[ ! -d "$debootstrap_scripts" ]]; then
+        log_warning "Debootstrap scripts directory not found at $debootstrap_scripts"
+        # Try to reinstall debootstrap to fix missing scripts
+        if command -v apt-get &>/dev/null; then
+            log_info "Reinstalling debootstrap to restore scripts..."
+            run_apt_get_with_retry "apt-get install --reinstall -y debootstrap"
+        fi
+    fi
+    
     mkdir -p "$target_dir"
     
     # Map version to codename for Ubuntu
@@ -606,6 +648,23 @@ install_ubuntu_debian() {
             10) codename="buster" ;;
             *) log_fatal "Unknown Debian version: $version" ;;
         esac
+    fi
+    
+    # Verify the codename script exists in debootstrap
+    if [[ -d "$debootstrap_scripts" ]] && [[ ! -f "$debootstrap_scripts/$codename" ]]; then
+        log_warning "Debootstrap script for $codename not found"
+        # Check if there's a symlink or alternate name we can use
+        if [[ -L "$debootstrap_scripts/$codename" ]]; then
+            local target=$(readlink -f "$debootstrap_scripts/$codename")
+            if [[ -f "$target" ]]; then
+                log_info "Found valid symlink for $codename pointing to $target"
+            else
+                log_warning "Symlink for $codename exists but target is missing"
+                log_info "Will rely on debootstrap's fallback mechanism"
+            fi
+        else
+            log_info "Will rely on debootstrap's fallback mechanism"
+        fi
     fi
     
     local mirror=""
@@ -713,16 +772,39 @@ install_arch() {
 prepare_disk() {
     log_info "Preparing disk for installation..."
     
-    # Unmount anything on /mnt
-    umount -R /mnt 2>/dev/null || true
+    # Check if root partition is currently mounted at /
+    # Use findmnt for more reliable detection
+    local root_is_mounted=false
+    local current_root_dev=$(findmnt -n -o SOURCE / 2>/dev/null)
+    if [[ "$current_root_dev" == "$ROOT_PARTITION" ]]; then
+        root_is_mounted=true
+        log_warning "Root partition $ROOT_PARTITION is currently mounted as /"
+        log_info "Will install to /mnt/newroot on current filesystem"
+    fi
     
-    # Format root partition
-    log_warning "Formatting $ROOT_PARTITION..."
-    mkfs.ext4 -F "$ROOT_PARTITION"
+    # Unmount anything on /mnt (except if it's our root)
+    if ! $root_is_mounted; then
+        umount -R /mnt 2>/dev/null || true
+    fi
     
-    # Mount new root
+    # Create target directory for new installation
     mkdir -p /mnt/newroot
-    mount "$ROOT_PARTITION" /mnt/newroot
+    
+    if $root_is_mounted; then
+        # Root is mounted - we're running from the live system
+        # Cannot format while mounted, so just prepare the directory
+        log_info "Installing new system to /mnt/newroot on current filesystem"
+        log_warning "Note: Old system files will remain until overwritten by new installation"
+        log_warning "A manual cleanup or reformat may be needed post-installation"
+    else
+        # Root is not mounted (running from rescue environment)
+        # Format root partition
+        log_warning "Formatting $ROOT_PARTITION..."
+        mkfs.ext4 -F "$ROOT_PARTITION"
+        
+        # Mount new root
+        mount "$ROOT_PARTITION" /mnt/newroot
+    fi
     
     log_success "Disk prepared"
 }
