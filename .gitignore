@@ -20,5 +20,4 @@ Thumbs.db
 *.sublime-*
 
 # Test artifacts
-test-*.sh
 /tmp/
