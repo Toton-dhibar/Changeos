@@ -564,7 +564,10 @@ detect_root_device() {
         
         # Last resort: try lsblk
         if [[ "$ROOT_PARTITION" == "/dev/root" ]] || [[ -z "$ROOT_PARTITION" ]]; then
-            ROOT_PARTITION=$(lsblk -no PKNAME,MOUNTPOINT | grep " /$" | awk '{print "/dev/"$1}')
+            local dev_name=$(lsblk -no NAME,MOUNTPOINT | grep " /$" | awk '{print $1}' | sed 's/[├─└─│]//g' | head -n1)
+            if [[ -n "$dev_name" ]]; then
+                ROOT_PARTITION="/dev/$dev_name"
+            fi
         fi
         
         log_info "Resolved /dev/root to actual device: $ROOT_PARTITION"
