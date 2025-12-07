@@ -559,12 +559,12 @@ detect_root_device() {
         
         # If still /dev/root, try using /proc/mounts
         if [[ "$ROOT_PARTITION" == "/dev/root" ]] || [[ -z "$ROOT_PARTITION" ]]; then
-            ROOT_PARTITION=$(grep " / " /proc/mounts | awk '{print $1}' | head -n1)
+            ROOT_PARTITION=$(grep "^[^ ]* / " /proc/mounts | awk '{print $1}' | head -n1)
         fi
         
         # Last resort: try lsblk
         if [[ "$ROOT_PARTITION" == "/dev/root" ]] || [[ -z "$ROOT_PARTITION" ]]; then
-            local dev_name=$(lsblk -rno NAME,MOUNTPOINT | grep " /$" | awk '{print $1}' | head -n1)
+            local dev_name=$(lsblk -rno NAME,MOUNTPOINT | grep "^[^ ]* /$" | awk '{print $1}' | head -n1)
             if [[ -n "$dev_name" ]]; then
                 ROOT_PARTITION="/dev/$dev_name"
             fi
@@ -655,7 +655,13 @@ install_ubuntu_debian() {
         log_warning "Debootstrap script for $codename not found"
         # Check if there's a symlink or alternate name we can use
         if [[ -L "$debootstrap_scripts/$codename" ]]; then
-            log_info "Found symlink for $codename"
+            local target=$(readlink -f "$debootstrap_scripts/$codename")
+            if [[ -f "$target" ]]; then
+                log_info "Found valid symlink for $codename pointing to $target"
+            else
+                log_warning "Symlink for $codename exists but target is missing"
+                log_info "Will rely on debootstrap's fallback mechanism"
+            fi
         else
             log_info "Will rely on debootstrap's fallback mechanism"
         fi
@@ -767,8 +773,10 @@ prepare_disk() {
     log_info "Preparing disk for installation..."
     
     # Check if root partition is currently mounted at /
+    # Use findmnt for more reliable detection
     local root_is_mounted=false
-    if mount | grep -F "${ROOT_PARTITION} on / " >/dev/null 2>&1; then
+    local current_root_dev=$(findmnt -n -o SOURCE / 2>/dev/null)
+    if [[ "$current_root_dev" == "$ROOT_PARTITION" ]]; then
         root_is_mounted=true
         log_warning "Root partition $ROOT_PARTITION is currently mounted as /"
         log_info "Will install to /mnt/newroot on current filesystem"
