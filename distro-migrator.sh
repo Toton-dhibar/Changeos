@@ -151,6 +151,124 @@ pause_prompt() {
 }
 
 #==============================================================================
+# NETWORK UTILITY FUNCTIONS
+#==============================================================================
+
+retry_with_backoff() {
+    local max_attempts="${1}"
+    local delay="${2}"
+    local max_delay="${3:-300}"
+    shift 3
+    local attempt=1
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        log_info "Attempt $attempt of $max_attempts: $*"
+        
+        if "$@"; then
+            return 0
+        fi
+        
+        if [[ $attempt -lt $max_attempts ]]; then
+            local wait_time=$((delay * attempt))
+            if [[ $wait_time -gt $max_delay ]]; then
+                wait_time=$max_delay
+            fi
+            log_warning "Command failed, retrying in ${wait_time}s..."
+            sleep "$wait_time"
+        fi
+        
+        attempt=$((attempt + 1))
+    done
+    
+    log_error "Command failed after $max_attempts attempts: $*"
+    return 1
+}
+
+verify_dns_resolution() {
+    local test_domains=("archive.ubuntu.com" "deb.debian.org" "google.com")
+    local resolved=0
+    
+    for domain in "${test_domains[@]}"; do
+        if host "$domain" &>/dev/null || nslookup "$domain" &>/dev/null || getent hosts "$domain" &>/dev/null; then
+            resolved=1
+            break
+        fi
+    done
+    
+    return $((1 - resolved))
+}
+
+fix_dns_resolution() {
+    log_warning "DNS resolution issues detected, attempting to fix..."
+    
+    # Backup current resolv.conf
+    cp /etc/resolv.conf /etc/resolv.conf.backup 2>/dev/null || true
+    
+    # Try using Google DNS and Cloudflare DNS as fallback
+    cat > /etc/resolv.conf << EOF
+# Temporary DNS configuration for migration
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+nameserver 1.1.1.1
+nameserver 1.0.0.1
+EOF
+    
+    log_info "Updated DNS to use public resolvers"
+    
+    # Test DNS resolution
+    if verify_dns_resolution; then
+        log_success "DNS resolution restored"
+        return 0
+    else
+        log_error "DNS resolution still failing"
+        # Restore backup if fix didn't work
+        if [[ -f /etc/resolv.conf.backup ]]; then
+            mv /etc/resolv.conf.backup /etc/resolv.conf
+        fi
+        return 1
+    fi
+}
+
+ensure_network_ready() {
+    log_info "Verifying network and DNS resolution..."
+    
+    # Check basic connectivity
+    if ! ping -c 1 -W 5 8.8.8.8 &>/dev/null; then
+        log_error "No basic network connectivity"
+        return 1
+    fi
+    
+    # Check DNS resolution
+    if ! verify_dns_resolution; then
+        log_warning "DNS resolution issues detected"
+        if ! fix_dns_resolution; then
+            log_error "Unable to fix DNS resolution"
+            return 1
+        fi
+    fi
+    
+    log_success "Network and DNS ready"
+    return 0
+}
+
+run_apt_get_with_retry() {
+    local cmd="$*"
+    
+    # Ensure network is ready before attempting
+    if ! ensure_network_ready; then
+        log_warning "Network not ready, proceeding anyway..."
+    fi
+    
+    # Run with retry logic
+    if ! retry_with_backoff 3 10 60 bash -c "$cmd"; then
+        log_error "apt-get command failed after retries: $cmd"
+        return 1
+    fi
+    
+    return 0
+}
+
+#==============================================================================
 # PRE-FLIGHT CHECKS
 #==============================================================================
 
@@ -180,6 +298,15 @@ check_network() {
     if ! ping -c 1 -W 5 8.8.8.8 &>/dev/null; then
         log_fatal "No network connectivity detected"
     fi
+    
+    # Also verify DNS resolution
+    if ! verify_dns_resolution; then
+        log_warning "DNS resolution issues detected during pre-flight checks"
+        if ! fix_dns_resolution; then
+            log_warning "DNS issues detected but will continue - may cause problems during installation"
+        fi
+    fi
+    
     log_success "Network connectivity verified"
 }
 
@@ -198,11 +325,11 @@ check_dependencies() {
         log_info "Installing missing dependencies..."
         
         if command -v apt-get &>/dev/null; then
-            apt-get update -qq && apt-get install -y "${missing[@]}"
+            run_apt_get_with_retry "apt-get update -qq && apt-get install -y ${missing[*]}"
         elif command -v yum &>/dev/null; then
-            yum install -y "${missing[@]}"
+            retry_with_backoff 3 10 60 yum install -y "${missing[@]}"
         elif command -v dnf &>/dev/null; then
-            dnf install -y "${missing[@]}"
+            retry_with_backoff 3 10 60 dnf install -y "${missing[@]}"
         else
             log_fatal "Cannot install dependencies - no package manager found"
         fi
@@ -444,15 +571,18 @@ install_ubuntu_debian() {
     
     log_info "Installing ${distro^} ${version}..."
     
+    # Ensure network is ready
+    ensure_network_ready || log_warning "Network issues detected, proceeding with caution"
+    
     # Install debootstrap if needed
     if ! command -v debootstrap &>/dev/null; then
         log_info "Installing debootstrap..."
         if command -v apt-get &>/dev/null; then
-            apt-get update -qq && apt-get install -y debootstrap
+            run_apt_get_with_retry "apt-get update -qq && apt-get install -y debootstrap"
         elif command -v yum &>/dev/null; then
-            yum install -y debootstrap
+            retry_with_backoff 3 10 60 yum install -y debootstrap
         elif command -v dnf &>/dev/null; then
-            dnf install -y debootstrap
+            retry_with_backoff 3 10 60 dnf install -y debootstrap
         fi
     fi
     
@@ -486,7 +616,10 @@ install_ubuntu_debian() {
     fi
     
     log_info "Running debootstrap for $codename..."
-    debootstrap --arch=amd64 "$codename" "$target_dir" "$mirror"
+    # Run debootstrap with retry logic
+    if ! retry_with_backoff 3 15 120 debootstrap --arch=amd64 "$codename" "$target_dir" "$mirror"; then
+        log_fatal "Failed to run debootstrap after multiple attempts"
+    fi
     
     log_success "${distro^} ${version} base system installed"
 }
@@ -497,6 +630,9 @@ install_rhel_based() {
     local target_dir="/mnt/newroot"
     
     log_info "Installing ${distro^} ${version}..."
+    
+    # Ensure network is ready
+    ensure_network_ready || log_warning "Network issues detected, proceeding with caution"
     
     mkdir -p "$target_dir"
     
@@ -521,23 +657,23 @@ install_rhel_based() {
             ;;
     esac
     
-    # Install using yum/dnf
+    # Install using yum/dnf with retry logic
     if command -v dnf &>/dev/null; then
         log_info "Using dnf for installation..."
-        dnf --installroot="$target_dir" --releasever="$version" \
-            --disablerepo="*" --repofrompath="base,$baseurl" --enablerepo="base" \
-            -y groupinstall "Minimal Install" || \
-            dnf --installroot="$target_dir" --releasever="$version" \
-            --disablerepo="*" --repofrompath="base,$baseurl" --enablerepo="base" \
-            -y install @core kernel grub2
+        retry_with_backoff 3 15 120 bash -c "dnf --installroot='$target_dir' --releasever='$version' \
+            --disablerepo='*' --repofrompath='base,$baseurl' --enablerepo='base' \
+            -y groupinstall 'Minimal Install'" || \
+            retry_with_backoff 3 15 120 bash -c "dnf --installroot='$target_dir' --releasever='$version' \
+            --disablerepo='*' --repofrompath='base,$baseurl' --enablerepo='base' \
+            -y install @core kernel grub2"
     elif command -v yum &>/dev/null; then
         log_info "Using yum for installation..."
-        yum --installroot="$target_dir" --releasever="$version" \
-            --disablerepo="*" --repofrompath="base,$baseurl" --enablerepo="base" \
-            -y groupinstall "Minimal Install" || \
-            yum --installroot="$target_dir" --releasever="$version" \
-            --disablerepo="*" --repofrompath="base,$baseurl" --enablerepo="base" \
-            -y install @core kernel grub2
+        retry_with_backoff 3 15 120 bash -c "yum --installroot='$target_dir' --releasever='$version' \
+            --disablerepo='*' --repofrompath='base,$baseurl' --enablerepo='base' \
+            -y groupinstall 'Minimal Install'" || \
+            retry_with_backoff 3 15 120 bash -c "yum --installroot='$target_dir' --releasever='$version' \
+            --disablerepo='*' --repofrompath='base,$baseurl' --enablerepo='base' \
+            -y install @core kernel grub2"
     else
         log_fatal "Neither yum nor dnf found"
     fi
@@ -550,10 +686,13 @@ install_arch() {
     
     log_info "Installing Arch Linux..."
     
+    # Ensure network is ready
+    ensure_network_ready || log_warning "Network issues detected, proceeding with caution"
+    
     # Install pacstrap if not available
     if ! command -v pacstrap &>/dev/null; then
         log_warning "pacstrap not available, downloading arch-install-scripts..."
-        wget -O /tmp/arch-install-scripts.tar.gz \
+        retry_with_backoff 3 10 60 wget -O /tmp/arch-install-scripts.tar.gz \
             https://github.com/archlinux/arch-install-scripts/archive/refs/heads/master.tar.gz
         tar -xzf /tmp/arch-install-scripts.tar.gz -C /tmp/
         export PATH="/tmp/arch-install-scripts-master:$PATH"
@@ -562,7 +701,7 @@ install_arch() {
     mkdir -p "$target_dir"
     
     log_info "Running pacstrap..."
-    pacstrap -c "$target_dir" base linux linux-firmware grub openssh networkmanager
+    retry_with_backoff 3 15 120 pacstrap -c "$target_dir" base linux linux-firmware grub openssh networkmanager
     
     log_success "Arch Linux base system installed"
 }
@@ -828,16 +967,20 @@ install_bootloader() {
 $ROOT_PARTITION / ext4 defaults 0 1
 EOF
     
+    # Ensure DNS is configured in chroot
+    cp /etc/resolv.conf "$target_dir/etc/resolv.conf" 2>/dev/null || true
+    
     # Install GRUB
     case "$TARGET_DISTRO" in
         ubuntu|debian)
-            chroot "$target_dir" apt-get update -qq || true
-            chroot "$target_dir" apt-get install -y grub-pc linux-image-generic || \
-            chroot "$target_dir" apt-get install -y grub2 linux-image-generic || true
+            # Use retry logic for package installation
+            retry_with_backoff 3 15 120 bash -c "chroot '$target_dir' apt-get update -qq" || true
+            retry_with_backoff 3 15 120 bash -c "chroot '$target_dir' apt-get install -y grub-pc linux-image-generic" || \
+            retry_with_backoff 3 15 120 bash -c "chroot '$target_dir' apt-get install -y grub2 linux-image-generic" || true
             ;;
         almalinux|rocky|centos|fedora)
-            chroot "$target_dir" dnf install -y grub2 kernel || \
-            chroot "$target_dir" yum install -y grub2 kernel || true
+            retry_with_backoff 3 15 120 bash -c "chroot '$target_dir' dnf install -y grub2 kernel" || \
+            retry_with_backoff 3 15 120 bash -c "chroot '$target_dir' yum install -y grub2 kernel" || true
             ;;
         arch)
             # Already installed with pacstrap
@@ -877,24 +1020,27 @@ post_install_config() {
     mount --bind /proc "$target_dir/proc"
     mount --bind /sys "$target_dir/sys"
     
+    # Ensure DNS is configured in chroot
+    cp /etc/resolv.conf "$target_dir/etc/resolv.conf" 2>/dev/null || true
+    
     # Set root password (random)
     local new_pass=$(openssl rand -base64 12)
     echo "root:$new_pass" | chroot "$target_dir" chpasswd
     log_warning "New root password: $new_pass"
     echo "NEW_ROOT_PASSWORD=$new_pass" >> "$BACKUP_DIR/migration-info.txt"
     
-    # Install essential packages
+    # Install essential packages with retry logic
     case "$TARGET_DISTRO" in
         ubuntu|debian)
-            chroot "$target_dir" apt-get update -qq || true
-            chroot "$target_dir" apt-get install -y openssh-server curl wget sudo || true
+            retry_with_backoff 3 15 120 bash -c "chroot '$target_dir' apt-get update -qq" || true
+            retry_with_backoff 3 15 120 bash -c "chroot '$target_dir' apt-get install -y openssh-server curl wget sudo" || true
             ;;
         almalinux|rocky|centos|fedora)
-            chroot "$target_dir" dnf install -y openssh-server curl wget sudo || \
-            chroot "$target_dir" yum install -y openssh-server curl wget sudo || true
+            retry_with_backoff 3 15 120 bash -c "chroot '$target_dir' dnf install -y openssh-server curl wget sudo" || \
+            retry_with_backoff 3 15 120 bash -c "chroot '$target_dir' yum install -y openssh-server curl wget sudo" || true
             ;;
         arch)
-            chroot "$target_dir" pacman -Sy --noconfirm openssh curl wget sudo || true
+            retry_with_backoff 3 15 120 bash -c "chroot '$target_dir' pacman -Sy --noconfirm openssh curl wget sudo" || true
             ;;
     esac
     
