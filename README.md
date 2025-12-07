@@ -151,7 +151,7 @@ sudo ./distro-migrator.sh
 - Dependency verification
 
 ### Backup System
-All critical files are backed up to `/tmp/distro-migration-backup/`:
+All critical files are backed up to `/var/backups/distro-migration-backup/`:
 - Network configurations
 - SSH keys and configs
 - hostname and hosts
@@ -174,7 +174,7 @@ All critical files are backed up to `/tmp/distro-migration-backup/`:
 
 ### Backup Location
 ```bash
-/tmp/distro-migration-backup/
+/var/backups/distro-migration-backup/
 ```
 
 ### View Logs
@@ -214,7 +214,7 @@ After reboot, verify:
 
 The script generates a random root password. Find it in:
 ```bash
-/tmp/distro-migration-backup/migration-info.txt
+/var/backups/distro-migration-backup/migration-info.txt
 ```
 
 ## ⚙️ Advanced Configuration
@@ -250,7 +250,7 @@ If you lose SSH access after migration:
    ```
 3. Restore from backup:
    ```bash
-   /tmp/distro-migration-backup/
+   /var/backups/distro-migration-backup/
    ```
 
 ### Boot Failure
@@ -382,7 +382,7 @@ For issues, questions, or contributions:
 
 ## 📌 Important Notes
 
-1. **Backup Externally**: The script creates a backup in `/tmp/`, which may be lost. Back up critical data externally before migration.
+1. **Backup Externally**: The script creates a backup in `/var/backups/`, which persists across reboots. However, it's still recommended to back up critical data externally before migration.
 
 2. **Test First**: Always test on a non-production system first.
 

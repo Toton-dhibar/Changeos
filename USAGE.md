@@ -257,7 +257,7 @@ If migration fails but you still have SSH access:
 tail -100 /var/log/distro-migration.log
 
 # 2. Check backup
-ls -la /tmp/distro-migration-backup/
+ls -la /var/backups/distro-migration-backup/
 
 # 3. Review error
 grep ERROR /var/log/distro-migration.log
