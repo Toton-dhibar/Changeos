@@ -564,7 +564,7 @@ detect_root_device() {
         
         # Last resort: try lsblk
         if [[ "$ROOT_PARTITION" == "/dev/root" ]] || [[ -z "$ROOT_PARTITION" ]]; then
-            local dev_name=$(lsblk -no NAME,MOUNTPOINT | grep " /$" | awk '{print $1}' | sed 's/[├─└─│]//g' | head -n1)
+            local dev_name=$(lsblk -rno NAME,MOUNTPOINT | grep " /$" | awk '{print $1}' | head -n1)
             if [[ -n "$dev_name" ]]; then
                 ROOT_PARTITION="/dev/$dev_name"
             fi
@@ -768,7 +768,7 @@ prepare_disk() {
     
     # Check if root partition is currently mounted at /
     local root_is_mounted=false
-    if mount | grep -q "^${ROOT_PARTITION} on / "; then
+    if mount | grep -F "${ROOT_PARTITION} on / " >/dev/null 2>&1; then
         root_is_mounted=true
         log_warning "Root partition $ROOT_PARTITION is currently mounted as /"
         log_info "Will install to /mnt/newroot on current filesystem"
@@ -786,7 +786,8 @@ prepare_disk() {
         # Root is mounted - we're running from the live system
         # Cannot format while mounted, so just prepare the directory
         log_info "Installing new system to /mnt/newroot on current filesystem"
-        log_warning "Root partition will be reformatted on first boot of new system"
+        log_warning "Note: Old system files will remain until overwritten by new installation"
+        log_warning "A manual cleanup or reformat may be needed post-installation"
     else
         # Root is not mounted (running from rescue environment)
         # Format root partition
