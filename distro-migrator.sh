@@ -325,7 +325,7 @@ check_dependencies() {
         log_info "Installing missing dependencies..."
         
         if command -v apt-get &>/dev/null; then
-            run_apt_get_with_retry "apt-get update -qq && apt-get install -y ${missing[*]}"
+            run_apt_get_with_retry "apt-get update -qq && apt-get install -y \"${missing[@]}\""
         elif command -v yum &>/dev/null; then
             retry_with_backoff 3 10 60 yum install -y "${missing[@]}"
         elif command -v dnf &>/dev/null; then
